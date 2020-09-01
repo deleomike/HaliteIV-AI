@@ -1,216 +1,302 @@
-# This Python 3 environment comes with many helpful analytics libraries installed
-# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
-# For example, here's several helpful packages to load
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
-# print("Checking Kaggle Env")
-# !pip install 'kaggle-environments==0.1.6' > /dev/null 2>&1
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+import os
+import sys
+import PIL.Image
 
-import numpy as np
-import gym
+import tensorflow as tf
+import logging
+
+from sklearn import preprocessing
 import random
 import matplotlib.pyplot as plt
-from random import choice
-from tqdm import tqdm
+import seaborn as sns
+
 from kaggle_environments import evaluate, make
-
-print("Hello World")
-
-actions = ["NORTH", "SOUTH", "EAST", "WEST", "HOLD", "MINE", "SPAWN", "CONVERT"]
+from kaggle_environments.envs.halite.helpers import *
 
 
-class HaliteIV(gym.Env):
-    def __init__(self, switch_prob=0.5):
-        self.env = make('halite', debug=True)
-        self.pair = [None, 'negamax', 'negamax', 'negamax']
-        self.trainer = self.env.train(self.pair)
-        self.switch_prob = switch_prob
+seed=123
+tf.compat.v1.set_random_seed(seed)
+session_conf = tf.compat.v1.ConfigProto(intra_op_parallelism_threads=1, inter_op_parallelism_threads=1)
+sess = tf.compat.v1.Session(graph=tf.compat.v1.get_default_graph(), config=session_conf)
+tf.compat.v1.keras.backend.set_session(sess)
+logging.disable(sys.maxsize)
+global ship_
 
-        # Define required gym fields (examples):
-        config = self.env.configuration
-        self.action_space = gym.spaces.Discrete(len(actions))
-        self.observation_space = gym.spaces.Discrete(config.size ** 2)
-
-    def switch_trainer(self):
-        self.pair = self.pair[::-1]
-        self.trainer = self.env.train(self.pair)
-
-    def step(self, action):
-        return self.trainer.step(action)
-
-    def reset(self):
-        if random.uniform(0, 1) < self.switch_prob:
-            self.switch_trainer()
-        res = self.trainer.reset()
-        return res
+env = make("halite", debug=True)
+env.run(["random"])
+env.render(mode="ipython",width=800, height=600)
 
 
-    def render(self, **kwargs):
-        return self.env.render(**kwargs)
+def getDirTo(fromPos, toPos, size):
+    fromX, fromY = divmod(fromPos[0], size), divmod(fromPos[1], size)
+    toX, toY = divmod(toPos[0], size), divmod(toPos[1], size)
+    if fromY < toY: return ShipAction.NORTH
+    if fromY > toY: return ShipAction.SOUTH
+    if fromX < toX: return ShipAction.EAST
+    if fromX > toX: return ShipAction.WEST
 
 
-class QTable:
-    def __init__(self, action_space):
-        self.table = dict()
-        self.action_space = action_space
+# Directions a ship can move
+directions = [ShipAction.NORTH, ShipAction.EAST, ShipAction.SOUTH, ShipAction.WEST]
 
-    def add_item(self, state_key):
-        self.table[state_key] = list(np.zeros(self.action_space.n))
-
-    def __call__(self, state):
-        board = state['board']  # Get a copy
-        board.append(state.mark)
-        state_key = np.array(board).astype(str)
-        state_key = hex(int(''.join(state_key), 3))[2:]
-        if state_key not in self.table.keys():
-            self.add_item(state_key)
-
-        return self.table[state_key]
+# Will keep track of whether a ship is collecting halite or carrying cargo to a shipyard
+ship_states = {}
 
 
-# Create Env
-env = HaliteIV()
+# Returns the commands we send to our ships and shipyards
+def simple_agent(obs, config):
+    size = config.size
+    board = Board(obs, config)
+    me = board.current_player
+    # If there are no ships, use first shipyard to spawn a ship.
+    if len(me.ships) == 0 and len(me.shipyards) > 0:
+        me.shipyards[0].next_action = ShipyardAction.SPAWN
 
-# hyperparameters
-alpha = 0.1
-gamma = 0.6
-epsilon = 0.99
-min_epsilon = 0.1
+    # If there are no shipyards, convert first ship into shipyard.
+    if len(me.shipyards) == 0 and len(me.ships) > 0:
+        me.ships[0].next_action = ShipAction.CONVERT
 
-#episodes = 10000
-episodes = 100
+    for ship in me.ships:
+        if ship.next_action == None:
 
-alpha_decay_step = 1000
-alpha_decay_rate = 0.9
-epsilon_decay_rate = 0.9999
+            ### Part 1: Set the ship's state
+            if ship.halite < 200:  # If cargo is too low, collect halite
+                ship_states[ship.id] = "COLLECT"
+            if ship.halite > 500:  # If cargo gets very big, deposit halite
+                ship_states[ship.id] = "DEPOSIT"
 
-print("Q Table init")
-q_table = QTable(env.action_space)
+            ### Part 2: Use the ship's state to select an action
+            if ship_states[ship.id] == "COLLECT":
+                # If halite at current location running low,
+                # move to the adjacent square containing the most halite
+                if ship.cell.halite < 100:
+                    neighbors = [ship.cell.north.halite, ship.cell.east.halite,
+                                 ship.cell.south.halite, ship.cell.west.halite]
+                    best = max(range(len(neighbors)), key=neighbors.__getitem__)
+                    ship.next_action = directions[best]
+            if ship_states[ship.id] == "DEPOSIT":
+                # Move towards shipyard to deposit cargo
+                direction = getDirTo(ship.position, me.shipyards[0].position, size)
+                if direction: ship.next_action = direction
 
-all_epochs = []
-all_total_rewards = []
-all_avg_rewards = []  # Last 100 steps
-all_qtable_rows = []
-all_epsilons = []
+    return me.next_actions
 
-for i in tqdm(range(episodes)):
-    state = env.reset()
-
-    epsilon = max(min_epsilon, epsilon * epsilon_decay_rate)
-    epochs, total_rewards = 0, 0
-    done = False
-
-    while not done:
-
-        if random.uniform(0, 1) < epsilon:
-
-            action = choice([c for c in range(env.action_space.n) if state['board'][c] == 0])
-        else:
-            row = q_table(state)[:]
-            selected_items = []
-            for j in range(env.action_space.n):
-                if state['board'][j] == 0:
-                    selected_items.append(row[j])
-                else:
-                    selected_items.append(-1e7)
-            action = int(np.argmax(selected_items))
-
-        next_state, reward, done, info = env.step(action)
-
-        # Apply new rules
-        if done:
-            if reward == 1:  # Won
-                reward = 20
-            elif reward == 0:  # Lost
-                reward = -20
-            else:  # Draw
-                reward = 10
-        else:
-            reward = -0.05  # Try to prevent the agent from taking a long move
-
-        old_value = q_table(state)[action]
-        next_max = np.max(q_table(next_state))
-
-        # Update Q-value
-        new_value = (1 - alpha) * old_value + alpha * (reward + gamma * next_max)
-        q_table(state)[action] = new_value
-
-        state = next_state
-        epochs += 1
-        total_rewards += reward
-
-    all_epochs.append(epochs)
-    all_total_rewards.append(total_rewards)
-    avg_rewards = np.mean(all_total_rewards[max(0, i - 100):(i + 1)])
-    all_avg_rewards.append(avg_rewards)
-    all_qtable_rows.append(len(q_table.table))
-    all_epsilons.append(epsilon)
-
-    if (i + 1) % alpha_decay_step == 0:
-        alpha *= alpha_decay_rate
-
-print(len(q_table.table))
+trainer = env.train([None, "random"])
+observation = trainer.reset()
+while not env.done:
+    my_action = simple_agent(observation, env.configuration)
+    print("My Action", my_action)
+    observation = trainer.step(my_action)[0]
+    print("Reward gained",observation.players[0][0])
 
 
-plt.plot(all_avg_rewards)
-plt.xlabel('Episode')
-plt.ylabel('Avg rewards (100)')
-plt.show()
-
-plt.plot(all_qtable_rows)
-plt.xlabel('Episode')
-plt.ylabel('Explored states')
-plt.show()
-
-plt.plot(all_epsilons)
-plt.xlabel('Episode')
-plt.ylabel('Epsilon')
-plt.show()
+env.render(mode="ipython",width=800, height=600)
 
 
-tmp_dict_q_table = q_table.table.copy()
-dict_q_table = dict()
+def ActorModel(num_actions, in_):
+    common = tf.keras.layers.Dense(128, activation='tanh')(in_)
+    common = tf.keras.layers.Dense(32, activation='tanh')(common)
+    common = tf.keras.layers.Dense(num_actions, activation='softmax')(common)
 
-for k in tmp_dict_q_table:
-    if np.count_nonzero(tmp_dict_q_table[k]) > 0:
-        dict_q_table[k] = int(np.argmax(tmp_dict_q_table[k]))
+    return common
 
-my_agent = '''def my_agent(observation, configuration):
-    from random import choice
 
-    q_table = ''' \
-    + str(dict_q_table).replace(' ', '') \
-    + '''
+def CriticModel(in_):
+    common = tf.keras.layers.Dense(128)(in_)
+    common = tf.keras.layers.ReLU()(common)
+    common = tf.keras.layers.Dense(32)(common)
+    common = tf.keras.layers.ReLU()(common)
+    common = tf.keras.layers.Dense(1)(common)
 
-    board = observation.board[:]
-    board.append(observation.mark)
-    state_key = list(map(str, board))
-    state_key = hex(int(''.join(state_key), 3))[2:]
+    return common
 
-    if state_key not in q_table.keys():
-        return choice([c for c in range(configuration.columns) if observation.board[c] == 0])
 
-    action = q_table[state_key]
+input_ = tf.keras.layers.Input(shape=[441,])
+model = tf.keras.Model(inputs=input_, outputs=[ActorModel(5,input_),CriticModel(input_)])
+model.summary()
 
-    if observation.board[action] != 0:
-        return choice([c for c in range(configuration.columns) if observation.board[c] == 0])
 
-    return action
-    '''
+optimizer = tf.keras.optimizers.Adam(lr=7e-4)
 
-print("Writing Agent")
-with open('submission.py', 'w') as f:
-    f.write(my_agent)
+huber_loss = tf.keras.losses.Huber()
+action_probs_history = []
+critic_value_history = []
+rewards_history = []
+running_reward = 0
+episode_count = 0
+num_actions = 5
+eps = np.finfo(np.float32).eps.item()
+gamma = 0.99  # Discount factor for past rewards
+env = make("halite", debug=True)
+trainer = env.train([None,"random"])
 
-print("Evaluating Agent")
 
-from submission import my_agent
+le = preprocessing.LabelEncoder()
+label_encoded = le.fit_transform(['NORTH', 'SOUTH', 'EAST', 'WEST', 'CONVERT'])
+label_encoded
 
-def mean_reward(rewards):
-    return sum(r[0] for r in rewards) / sum(r[0] + r[1] for r in rewards)
 
-# Run multiple episodes to estimate agent's performance.
-print("My Agent vs Random Agent:", mean_reward(evaluate("connectx", [my_agent, "random"], num_episodes=10)))
-print("My Agent vs Negamax Agent:", mean_reward(evaluate("connectx", [my_agent, "negamax"], num_episodes=10)))
+def getDirTo(fromPos, toPos, size):
+    fromX, fromY = divmod(fromPos[0], size), divmod(fromPos[1], size)
+    toX, toY = divmod(toPos[0], size), divmod(toPos[1], size)
+    if fromY < toY: return ShipAction.NORTH
+    if fromY > toY: return ShipAction.SOUTH
+    if fromX < toX: return ShipAction.EAST
+    if fromX > toX: return ShipAction.WEST
 
-# You can write up to 5GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All"
-# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+
+# Directions a ship can move
+directions = [ShipAction.NORTH, ShipAction.EAST, ShipAction.SOUTH, ShipAction.WEST]
+
+
+def decodeDir(act_):
+    if act_ == 'NORTH': return directions[0]
+    if act_ == 'EAST': return directions[1]
+    if act_ == 'SOUTH': return directions[2]
+    if act_ == 'WEST': return directions[3]
+
+
+# Will keep track of whether a ship is collecting halite or carrying cargo to a shipyard
+ship_states = {}
+ship_ = 0
+
+
+def update_L1():
+    ship_ += 1
+
+
+# Returns the commands we send to our ships and shipyards
+def advanced_agent(obs, config, action):
+    size = config.size
+    board = Board(obs, config)
+    me = board.current_player
+    act = le.inverse_transform([action])[0]
+    global ship_
+
+    # If there are no ships, use first shipyard to spawn a ship.
+    if len(me.ships) == 0 and len(me.shipyards) > 0:
+        me.shipyards[ship_ - 1].next_action = ShipyardAction.SPAWN
+
+    # If there are no shipyards, convert first ship into shipyard.
+    if len(me.shipyards) == 0 and len(me.ships) > 0 and ship_ == 0:
+        me.ships[0].next_action = ShipAction.CONVERT
+    try:
+        if act == 'CONVERT':
+            me.ships[0].next_action = ShipAction.CONVERT
+            update_L1()
+            if len(me.ships) == 0 and len(me.shipyards) > 0:
+                me.shipyards[ship_ - 1].next_action = ShipyardAction.SPAWN
+        if me.ships[0].halite < 200:
+            ship_states[me.ships[0].id] = 'COLLECT'
+        if me.ships[0].halite > 800:
+            ship_states[me.ships[0].id] = 'DEPOSIT'
+
+        if ship_states[me.ships[0].id] == 'COLLECT':
+            if me.ships[0].cell.halite < 100:
+                me.ships[0].next_action = decodeDir(act)
+        if ship_states[me.ships[0].id] == 'DEPOSIT':
+            # Move towards shipyard to deposit cargo
+            direction = getDirTo(me.ships[0].position, me.shipyards[ship_ - 1].position, size)
+            if direction: me.ships[0].next_action = direction
+    except:
+        pass
+
+    return me.next_actions
+
+
+while not env.done:
+    state = trainer.reset()
+    episode_reward = 0
+    with tf.GradientTape() as tape:
+        for timestep in range(1, env.configuration.episodeSteps + 200):
+            # of the agent in a pop up window.
+            state_ = tf.convert_to_tensor(state.halite)
+            state_ = tf.expand_dims(state_, 0)
+            # Predict action probabilities and estimated future rewards
+            # from environment state
+            action_probs, critic_value = model(state_)
+            critic_value_history.append(critic_value[0, 0])
+
+            # Sample action from action probability distribution
+            action = np.random.choice(num_actions, p=np.squeeze(action_probs))
+            action_probs_history.append(tf.math.log(action_probs[0, action]))
+
+            # Apply the sampled action in our environment
+            action = advanced_agent(state, env.configuration, action)
+            state = trainer.step(action)[0]
+            gain = state.players[0][0] / 5000
+            rewards_history.append(gain)
+            episode_reward += gain
+
+            if env.done:
+                state = trainer.reset()
+                # Update running reward to check condition for solving
+        running_reward = 0.05 * episode_reward + (1 - 0.05) * running_reward
+
+        # Calculate expected value from rewards
+        # - At each timestep what was the total reward received after that timestep
+        # - Rewards in the past are discounted by multiplying them with gamma
+        # - These are the labels for our critic
+        returns = []
+        discounted_sum = 0
+        for r in rewards_history[::-1]:
+            discounted_sum = r + gamma * discounted_sum
+            returns.insert(0, discounted_sum)
+        # Normalize
+        returns = np.array(returns)
+        returns = (returns - np.mean(returns)) / (np.std(returns) + eps)
+        returns = returns.tolist()
+        # Calculating loss values to update our network
+        history = zip(action_probs_history, critic_value_history, returns)
+        actor_losses = []
+        critic_losses = []
+        for log_prob, value, ret in history:
+            # At this point in history, the critic estimated that we would get a
+            # total reward = `value` in the future. We took an action with log probability
+            # of `log_prob` and ended up recieving a total reward = `ret`.
+            # The actor must be updated so that it predicts an action that leads to
+            # high rewards (compared to critic's estimate) with high probability.
+            diff = ret - value
+            actor_losses.append(-log_prob * diff)  # actor loss
+
+            # The critic must be updated so that it predicts a better estimate of
+            # the future rewards.
+            critic_losses.append(
+                huber_loss(tf.expand_dims(value, 0), tf.expand_dims(ret, 0))
+            )
+        # Backpropagation
+        loss_value = sum(actor_losses) + sum(critic_losses)
+        grads = tape.gradient(loss_value, model.trainable_variables)
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+        # Clear the loss and reward history
+        action_probs_history.clear()
+        critic_value_history.clear()
+        rewards_history.clear()
+
+    # Log details
+    episode_count += 1
+    if episode_count % 10 == 0:
+        template = "running reward: {:.2f} at episode {}"
+        print(template.format(running_reward, episode_count))
+
+    if running_reward > 550:  # Condition to consider the task solved
+        print("Solved at episode {}!".format(episode_count))
+        break
+
+
+while not env.done:
+    state_ = tf.convert_to_tensor(state.halite)
+    state_ = tf.expand_dims(state_, 0)
+    action_probs, critic_value = model(state_)
+    critic_value_history.append(critic_value[0, 0])
+    action = np.random.choice(num_actions, p=np.squeeze(action_probs))
+    action_probs_history.append(tf.math.log(action_probs[0, action]))
+    action = advanced_agent(state, env.configuration, action)
+    state = trainer.step(action)[0]
