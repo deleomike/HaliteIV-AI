@@ -4,6 +4,8 @@ from __future__ import print_function
 
 import cProfile
 
+from tqdm import tqdm
+
 import torch
 import torch.optim as optim
 import tensorflow as tf
@@ -25,7 +27,7 @@ from kaggle_environments.envs.halite.helpers import *
 
 
 #########################################################3
-from Models import Actor, Critic
+from Models import ActorModel, CriticModel, Actor, Critic, compute_returns
 from Agents import simple_agent, advanced_agent
 ############################################################
 
@@ -39,7 +41,7 @@ seed=123
 torch.manual_seed(seed)
 
 tf.compat.v1.set_random_seed(seed)
-session_conf = tf.compat.v1.ConfigProto(intra_op_parallelism_threads=1, inter_op_parallelism_threads=1)
+session_conf = tf.compat.v1.ConfigProto(intra_op_parallelism_threads=10, inter_op_parallelism_threads=10)
 sess = tf.compat.v1.Session(graph=tf.compat.v1.get_default_graph(), config=session_conf)
 tf.compat.v1.keras.backend.set_session(sess)
 logging.disable(sys.maxsize)
@@ -63,6 +65,7 @@ def getDirTo(fromPos, toPos, size):
 
 trainer = env.train([None, "random"])
 observation = trainer.reset()
+flatBoardLen = len(observation['halite'])
 while not env.done:
     my_action = simple_agent(observation, env.configuration)
     print("My Action", my_action)
@@ -76,9 +79,9 @@ env.render(mode="ipython",width=800, height=600)
 
 
 
-# input_ = tf.keras.layers.Input(shape=[441,])
-# model = tf.keras.Model(inputs=input_, outputs=[ActorModel(5,input_),CriticModel(input_)])
-# model.summary()
+input_ = tf.keras.layers.Input(shape=[441,])
+model = tf.keras.Model(inputs=input_, outputs=[ActorModel(5,input_),CriticModel(input_)])
+model.summary()
 
 lr = 0.0001
 
@@ -95,7 +98,66 @@ gamma = 0.99  # Discount factor for past rewards
 env = make("halite", debug=True)
 trainer = env.train([None,"random"])
 
+def trainIters(actor, critic, n_iters):
+    optimizerA = optim.Adam(actor.parameters())
+    optimizerC = optim.Adam(critic.parameters())
+    for iter in tqdm(range(n_iters)):
+        kag_state = env.reset()
+        log_probs = []
+        values = []
+        rewards = []
+        masks = []
+        entropy = 0
+        env.reset()
 
+        for i in range(1000):
+            env.render()
+
+            state = kag_state[0]['observation']['halite']
+
+            state = torch.FloatTensor(state).to(device)
+            dist, value = actor(state), critic(state)
+
+            action = dist.sample()
+            next_state, reward, done, _ = env.step(action.cpu().numpy())
+
+            log_prob = dist.log_prob(action).unsqueeze(0)
+            entropy += dist.entropy().mean()
+
+            log_probs.append(log_prob)
+            values.append(value)
+            rewards.append(torch.tensor([reward], dtype=torch.float, device=device))
+            masks.append(torch.tensor([1-done], dtype=torch.float, device=device))
+
+            state = next_state
+
+            if done:
+                print('Iteration: {}, Score: {}'.format(iter, i))
+                break
+
+
+        next_state = torch.FloatTensor(next_state).to(device)
+        next_value = critic(next_state)
+        returns = compute_returns(next_value, rewards, masks)
+
+        log_probs = torch.cat(log_probs)
+        returns = torch.cat(returns).detach()
+        values = torch.cat(values)
+
+        advantage = returns - values
+
+        actor_loss = -(log_probs * advantage.detach()).mean()
+        critic_loss = advantage.pow(2).mean()
+
+        optimizerA.zero_grad()
+        optimizerC.zero_grad()
+        actor_loss.backward()
+        critic_loss.backward()
+        optimizerA.step()
+        optimizerC.step()
+    torch.save(actor, 'model/actor.pkl')
+    torch.save(critic, 'model/critic.pkl')
+    env.close()
 
 def train_torch(actor, critic, reward_thresh=550):
     optimizerA = optim.Adam(actor.parameters(), lr=lr)
@@ -104,6 +166,8 @@ def train_torch(actor, critic, reward_thresh=550):
     while not env.done:
         state = trainer.reset()
         episode_reward = 0
+        log_probs = []
+
         for timestep in range(1, env.configuration.episodeSteps + 200):
             ##########################################################
             ####      Part 1: Calculate Action from Model         ####
@@ -113,17 +177,21 @@ def train_torch(actor, critic, reward_thresh=550):
             state_ = torch.tensor(state.halite).cuda(device=device)
 
             # predictions
-            action_prob = actor.forward(state_)
+            actions_prob = actor.forward(state_)
             critic_value = critic.forward(state_)
 
             # store critic value
             critic_value_history.append(critic_value)
 
             # Get sample action from action pdf
-            action = np.random.choice(num_actions, p=np.squeeze(action_prob))
+            action = np.random.choice(num_actions, p=np.squeeze(actions_prob))
+
+            # log probability
+            log_prob = actions_prob.log_prob(action).unsqueeze(0)
+            log_probs.append(log_probs)
 
             # store the action probabilities normalized with log
-            action_probs_history.append(torch.math.log(action_prob[0, action]))
+            action_probs_history.append(torch.math.log(actions_prob[0, action]))
 
             ##########################################################
             ### Part 2: Apply the sampled action in our environment ##
@@ -186,8 +254,8 @@ def train_torch(actor, critic, reward_thresh=550):
 
         optimizerA.zero_grad()
         optimizerC.zero_grad()
-        actor_loss.backward()
-        critic_loss.backward()
+        # actor_loss.backward()
+        # critic_loss.backward()
         optimizerA.step()
         optimizerC.step()
 
@@ -195,8 +263,18 @@ def train_torch(actor, critic, reward_thresh=550):
     torch.save(critic, 'model/critic.pkl')
 
 
-def train_tf(Actor, Critic, rewardThresh):
+def train_tf(model, rewardThresh):
     episode_count = 0
+    huber_loss = tf.keras.losses.Huber()
+    action_probs_history = []
+    critic_value_history = []
+    rewards_history = []
+    running_reward = 0
+    num_actions = 5
+    eps = np.finfo(np.float32).eps.item()
+    gamma = 0.99  # Discount factor for past rewards
+    env = make("halite", debug=True)
+    trainer = env.train([None, "random"])
     while not env.done:
         state = trainer.reset()
         episode_reward = 0
@@ -276,6 +354,15 @@ def train_tf(Actor, Critic, rewardThresh):
         if running_reward > rewardThresh:  # Condition to consider the task solved
             print("Solved at episode {}!".format(episode_count))
             break
+
+#train_tf(model=model, rewardThresh=100)
+
+numActions = 4
+stateSize = flatBoardLen
+actor = Actor(state_size=stateSize, action_size=numActions).cuda(device=device)
+critic = Critic(state_size=stateSize, action_size=numActions).cuda(device=device)
+
+trainIters(actor, critic, 100)
 
 pr.disable()
 
